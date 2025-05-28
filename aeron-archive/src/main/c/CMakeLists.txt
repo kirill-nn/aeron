@@ -58,7 +58,7 @@ if (MSVC AND "${CMAKE_SYSTEM_NAME}" MATCHES "Windows")
     set(BUILD_SHARED_LIBS ON)
 endif ()
 
-find_package(Java REQUIRED)
+#find_package(Java REQUIRED)
 
 set(CODEC_SCHEMA ${ARCHIVE_CODEC_SCHEMA_DIR}/aeron-archive-codecs.xml)
 set(GENERATED_C_CODECS
