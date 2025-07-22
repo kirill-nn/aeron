@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <iterator>
 #include <stdexcept>
 
@@ -31,12 +32,14 @@
 extern "C"
 {
 #include "aeron_common.h"
+#include "uri/aeron_uri.h"
 }
 
 namespace aeron
 {
 
 using namespace aeron::concurrent::logbuffer;
+using AsyncDestination = aeron_async_destination_t;
 
 class AsyncAddSubscription
 {
@@ -237,7 +240,7 @@ public:
      */
     std::string tryResolveChannelEndpointPort() const
     {
-        char uri_buffer[AERON_CLIENT_MAX_LOCAL_ADDRESS_STR_LEN] = { 0 };
+        char uri_buffer[AERON_URI_MAX_LENGTH] = { 0 };
 
         if (aeron_subscription_try_resolve_channel_endpoint_port(m_subscription, uri_buffer, sizeof(uri_buffer)) < 0)
         {

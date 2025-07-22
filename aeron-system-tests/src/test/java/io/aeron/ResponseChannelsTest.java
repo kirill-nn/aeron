@@ -45,10 +45,12 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import static io.aeron.CommonContext.*;
@@ -74,9 +76,9 @@ public class ResponseChannelsTest
     {
         final MediaDriver.Context context = new MediaDriver.Context()
             .aeronDirectoryName(generateRandomDirName())
+            .dirDeleteOnShutdown(true)
             .publicationTermBufferLength(LogBufferDescriptor.TERM_MIN_LENGTH)
-            .threadingMode(ThreadingMode.SHARED)
-            .enableExperimentalFeatures(true);
+            .threadingMode(ThreadingMode.SHARED);
 
         driver1 = TestMediaDriver.launch(
             context.clone().aeronDirectoryName(context.aeronDirectoryName() + "-1"), watcher);
@@ -181,6 +183,89 @@ public class ResponseChannelsTest
                 Tests.awaitConnected(pubRsp);
             }
         }
+    }
+
+    @ParameterizedTest
+    @InterruptAfter(5)
+    @ValueSource(booleans = { true, false })
+    void shouldConnectResponsePublicationUsingImageAndIpc(final boolean useExclusive)
+    {
+        CloseHelper.quietClose(driver2);
+
+        try (Aeron server = Aeron.connect(new Aeron.Context().aeronDirectoryName(driver1.aeronDirectoryName()));
+            Aeron client = Aeron.connect(new Aeron.Context().aeronDirectoryName(driver1.aeronDirectoryName()));
+            Subscription subReq = server.addSubscription("aeron:ipc", REQUEST_STREAM_ID))
+        {
+            try (Subscription subRsp1 = client.addSubscription(
+                "aeron:ipc?control-mode=response|alias=client1", RESPONSE_STREAM_ID);
+                Publication pubReq1 = newPublication(
+                    useExclusive,
+                    client,
+                    "aeron:ipc?response-correlation-id=" + subRsp1.registrationId(),
+                    REQUEST_STREAM_ID);
+                Subscription subRsp2 = client.addSubscription(
+                    "aeron:ipc?control-mode=response|alias=client2", RESPONSE_STREAM_ID);
+                Publication pubReq2 = newPublication(
+                    useExclusive,
+                    client,
+                    "aeron:ipc?response-correlation-id=" + subRsp2.registrationId(),
+                    REQUEST_STREAM_ID))
+            {
+                Tests.awaitConnected(pubReq1);
+                Tests.awaitConnected(pubReq2);
+                Tests.await(() -> 2 == subReq.imageCount());
+
+                final String url1 = "aeron:ipc?control-mode=response|response-correlation-id=" +
+                    subReq.imageAtIndex(0).correlationId();
+                final String url2 = "aeron:ipc?control-mode=response|response-correlation-id=" +
+                    subReq.imageAtIndex(1).correlationId();
+
+                try (Publication pubRsp1 = newPublication(useExclusive, server, url1, RESPONSE_STREAM_ID);
+                    Publication pubRsp2 = newPublication(useExclusive, server, url2, RESPONSE_STREAM_ID))
+                {
+                    Tests.awaitConnected(subRsp1);
+                    Tests.awaitConnected(subRsp2);
+                    Tests.awaitConnected(pubRsp1);
+                    Tests.awaitConnected(pubRsp2);
+
+                    final DirectBuffer msg1 = new UnsafeBuffer("msg1".getBytes(UTF_8));
+                    final DirectBuffer msg2 = new UnsafeBuffer("msg2".getBytes(UTF_8));
+
+                    while (pubRsp1.offer(msg1) < 0)
+                    {
+                        Tests.yield();
+                    }
+
+                    while (pubRsp2.offer(msg2) < 0)
+                    {
+                        Tests.yield();
+                    }
+
+                    final long deadlineMs = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(1);
+                    int sub1FragmentCount = 0;
+                    int sub2FragmentCount = 0;
+                    while (System.currentTimeMillis() < deadlineMs)
+                    {
+                        sub1FragmentCount += subRsp1.poll((buffer, offset, length, header) -> {}, 10);
+                        sub2FragmentCount += subRsp2.poll((buffer, offset, length, header) -> {}, 10);
+                        Tests.yield();
+
+                        assertTrue(sub1FragmentCount < 2);
+                        assertTrue(sub2FragmentCount < 2);
+                    }
+                }
+            }
+        }
+    }
+
+    private static Publication newPublication(
+        final boolean useExclusive,
+        final Aeron client,
+        final String channel,
+        final int streamId)
+    {
+        return useExclusive ? client.addExclusivePublication(channel, streamId) :
+            client.addPublication(channel, streamId);
     }
 
     @Test

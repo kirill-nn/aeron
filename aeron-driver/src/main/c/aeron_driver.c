@@ -252,6 +252,7 @@ void aeron_driver_fill_cnc_metadata(aeron_driver_context_t *context)
     metadata->client_liveness_timeout = (int64_t)context->client_liveness_timeout_ns;
     metadata->start_timestamp = context->epoch_clock();
     metadata->pid = getpid();
+    metadata->file_page_size = (int32_t)context->file_page_size;
 
     context->to_driver_buffer = aeron_cnc_to_driver_buffer(metadata);
     context->to_clients_buffer = aeron_cnc_to_clients_buffer(metadata);
@@ -533,6 +534,8 @@ void aeron_driver_context_print_configuration(aeron_driver_context_t *context)
     fprintf(fpout, "\n    nak_unicast_delay_ns=%" PRIu64, context->nak_unicast_delay_ns);
     fprintf(fpout, "\n    nak_unicast_retry_delay_ratio=%" PRIu64, context->nak_unicast_retry_delay_ratio);
     fprintf(fpout, "\n    nak_multicast_max_backoff_ns=%" PRIu64, context->nak_multicast_max_backoff_ns);
+    fprintf(fpout, "\n    unicast_flow_control_rrwm=%" PRIu64, (uint64_t)context->unicast_flow_control_rrwm);
+    fprintf(fpout, "\n    multicast_flow_control_rrwm=%" PRIu64, (uint64_t)context->multicast_flow_control_rrwm);
     fprintf(fpout, "\n    nak_multicast_group_size=%" PRIu64, (uint64_t)context->nak_multicast_group_size);
     fprintf(fpout, "\n    status_message_timeout_ns=%" PRIu64, context->status_message_timeout_ns);
     fprintf(fpout, "\n    counter_free_to_reuse_ns=%" PRIu64, context->counter_free_to_reuse_ns);
@@ -567,7 +570,6 @@ void aeron_driver_context_print_configuration(aeron_driver_context_t *context)
         (uint64_t)context->network_publication_max_messages_per_send);
     fprintf(fpout, "\n    resource_free_limit=%" PRIu32, context->resource_free_limit);
     fprintf(fpout, "\n    async_executor_threads=%" PRIu32, context->async_executor_threads);
-    fprintf(fpout, "\n    async_executor_cpu_affinity_no=%" PRId32, context->async_executor_cpu_affinity_no);
     fprintf(fpout, "\n    conductor_cpu_affinity_no=%" PRId32, context->conductor_cpu_affinity_no);
     fprintf(fpout, "\n    receiver_cpu_affinity_no=%" PRId32, context->receiver_cpu_affinity_no);
     fprintf(fpout, "\n    sender_cpu_affinity_no=%" PRId32, context->sender_cpu_affinity_no);
@@ -895,11 +897,11 @@ int aeron_driver_init(aeron_driver_t **driver, aeron_driver_context_t *context)
 
     _driver->context->receiver_proxy = &_driver->receiver.receiver_proxy;
 
-    aeron_counter_set_ordered(
+    aeron_counter_set_release(
         aeron_system_counter_addr(context->system_counters, AERON_SYSTEM_COUNTER_AERON_VERSION),
         aeron_semantic_version_compose(aeron_version_major(), aeron_version_minor(), aeron_version_patch()));
 
-    aeron_counter_set_ordered(
+    aeron_counter_set_release(
         aeron_system_counter_addr(context->system_counters, AERON_SYSTEM_COUNTER_BYTES_CURRENTLY_MAPPED),
         (int64_t)(_driver->context->cnc_map.length + _driver->context->loss_report_length));
 
@@ -1063,17 +1065,18 @@ int aeron_driver_start(aeron_driver_t *driver, bool manual_main_loop)
     }
     else
     {
-        if (NULL != driver->runners[0].on_start)
+        aeron_agent_runner_t first_runner = driver->runners[0];
+        if (NULL != first_runner.on_start)
         {
-            driver->runners[0].on_start(driver->runners[0].on_start_state, driver->runners[0].role_name);
+            first_runner.on_start(first_runner.on_start_state, first_runner.role_name);
         }
 
-        driver->runners[0].state = AERON_AGENT_STATE_MANUAL;
+        first_runner.state = AERON_AGENT_STATE_MANUAL;
     }
 
     for (int i = 1; i < AERON_AGENT_RUNNER_MAX; i++)
     {
-        if (driver->runners[i].state == AERON_AGENT_STATE_INITED)
+        if (AERON_AGENT_STATE_INITED == driver->runners[i].state)
         {
             if (aeron_agent_start(&driver->runners[i]) < 0)
             {

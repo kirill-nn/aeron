@@ -151,7 +151,7 @@ static void aeron_driver_untethered_subscription_state_change_null(
 #define AERON_CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT (10 * 1000 * 1000 * INT64_C(1000))
 #define AERON_TERM_BUFFER_LENGTH_DEFAULT (16 * 1024 * 1024)
 #define AERON_IPC_TERM_BUFFER_LENGTH_DEFAULT (64 * 1024 * 1024)
-#define AERON_TERM_BUFFER_SPARSE_FILE_DEFAULT (false)
+#define AERON_TERM_BUFFER_SPARSE_FILE_DEFAULT (true)
 #define AERON_PERFORM_STORAGE_CHECKS_DEFAULT (true)
 #define AERON_LOW_FILE_STORE_WARNING_THRESHOLD_DEFAULT (AERON_TERM_BUFFER_LENGTH_DEFAULT * INT64_C(10))
 #define AERON_SPIES_SIMULATE_CONNECTION_DEFAULT (false)
@@ -210,7 +210,6 @@ static void aeron_driver_untethered_subscription_state_change_null(
 #define AERON_SENDER_MAX_MESSAGES_PER_SEND_DEFAULT UINT32_C(2)
 #define AERON_DRIVER_RESOURCE_FREE_LIMIT_DEFAULT UINT32_C(10)
 #define AERON_DRIVER_ASYNC_EXECUTOR_THREADS_DEFAULT UINT32_C(1)
-#define AERON_DRIVER_ASYNC_EXECUTOR_CPU_AFFINITY_DEFAULT (-1)
 #define AERON_CPU_AFFINITY_DEFAULT (-1)
 #define AERON_DRIVER_CONNECT_DEFAULT true
 #define AERON_ENABLE_EXPERIMENTAL_FEATURES_DEFAULT false
@@ -324,6 +323,8 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
 
     _context->agent_on_start_func = NULL;
     _context->agent_on_start_state = NULL;
+    _context->agent_on_start_func_delegate = NULL;
+    _context->agent_on_start_state_delegate = NULL;
 
     if ((_context->unicast_flow_control_supplier_func = aeron_flow_control_strategy_supplier_load(
         AERON_UNICAST_FLOWCONTROL_SUPPLIER_DEFAULT)) == NULL)
@@ -415,12 +416,15 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     _context->publication_connection_timeout_ns = AERON_PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT;
     _context->counter_free_to_reuse_ns = AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT_NS_DEFAULT;
     _context->untethered_window_limit_timeout_ns = AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_DEFAULT;
+    _context->untethered_linger_timeout_ns = AERON_NULL_VALUE;
     _context->untethered_resting_timeout_ns = AERON_UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT;
     _context->max_resend = AERON_RETRANSMIT_HANDLER_MAX_RESEND;
     _context->retransmit_unicast_delay_ns = AERON_RETRANSMIT_UNICAST_DELAY_NS_DEFAULT;
     _context->retransmit_unicast_linger_ns = AERON_RETRANSMIT_UNICAST_LINGER_NS_DEFAULT;
     _context->nak_multicast_group_size = AERON_NAK_MULTICAST_GROUP_SIZE_DEFAULT;
     _context->nak_multicast_max_backoff_ns = AERON_NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT;
+    _context->multicast_flow_control_rrwm = AERON_MULTICAST_FLOW_CONTROL_RETRANSMIT_RECEIVER_WINDOW_MULTIPLE;
+    _context->unicast_flow_control_rrwm = AERON_UNICAST_FLOW_CONTROL_RETRANSMIT_RECEIVER_WINDOW_MULTIPLE;
     _context->nak_unicast_delay_ns = AERON_NAK_UNICAST_DELAY_NS_DEFAULT;
     _context->nak_unicast_retry_delay_ratio = AERON_NAK_UNICAST_RETRY_DELAY_RATIO_DEFAULT;
     _context->publication_reserved_session_id_low = AERON_PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT;
@@ -439,7 +443,6 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     _context->network_publication_max_messages_per_send = AERON_SENDER_MAX_MESSAGES_PER_SEND_DEFAULT;
     _context->resource_free_limit = AERON_DRIVER_RESOURCE_FREE_LIMIT_DEFAULT;
     _context->async_executor_threads = AERON_DRIVER_ASYNC_EXECUTOR_THREADS_DEFAULT;
-    _context->async_executor_cpu_affinity_no = AERON_DRIVER_ASYNC_EXECUTOR_CPU_AFFINITY_DEFAULT;
     _context->connect_enabled = AERON_DRIVER_CONNECT_DEFAULT;
     _context->conductor_cpu_affinity_no = AERON_CPU_AFFINITY_DEFAULT;
     _context->sender_cpu_affinity_no = AERON_CPU_AFFINITY_DEFAULT;
@@ -675,12 +678,6 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         _context->sender_cpu_affinity_no,
         -1,
         255);
-    _context->async_executor_cpu_affinity_no = aeron_config_parse_int32(
-        AERON_DRIVER_ASYNC_EXECUTOR_CPU_AFFINITY_ENV_VAR,
-        getenv(AERON_DRIVER_ASYNC_EXECUTOR_CPU_AFFINITY_ENV_VAR),
-        _context->async_executor_cpu_affinity_no,
-        -1,
-        255);
 
     _context->send_to_sm_poll_ratio = (uint8_t)aeron_config_parse_uint64(
         AERON_SEND_TO_STATUS_POLL_RATIO_ENV_VAR,
@@ -770,6 +767,13 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT_ENV_VAR,
         getenv(AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT_ENV_VAR),
         _context->untethered_window_limit_timeout_ns,
+        1000,
+        INT64_MAX);
+
+    _context->untethered_linger_timeout_ns = aeron_config_parse_duration_ns(
+        AERON_UNTETHERED_LINGER_TIMEOUT_ENV_VAR,
+        getenv(AERON_UNTETHERED_LINGER_TIMEOUT_ENV_VAR),
+        _context->untethered_linger_timeout_ns,
         1000,
         INT64_MAX);
 
@@ -870,8 +874,8 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         INT32_MAX);
 
     _context->flow_control.receiver_timeout_ns = aeron_config_parse_duration_ns(
-        AERON_MIN_MULTICAST_FLOW_CONTROL_RECEIVER_TIMEOUT_ENV_VAR,
-        getenv(AERON_MIN_MULTICAST_FLOW_CONTROL_RECEIVER_TIMEOUT_ENV_VAR),
+        AERON_FLOW_CONTROL_RECEIVER_TIMEOUT_ENV_VAR,
+        getenv(AERON_FLOW_CONTROL_RECEIVER_TIMEOUT_ENV_VAR),
         _context->flow_control.receiver_timeout_ns,
         0,
         INT64_MAX);
@@ -1394,6 +1398,17 @@ int aeron_driver_validate_untethered_timeouts(aeron_driver_context_t *context)
             EINVAL,
             "untethered_resting_timeout_ns=%" PRIu64 " <= timer_interval_ns=%" PRIu64,
             context->untethered_resting_timeout_ns, context->timer_interval_ns);
+        return -1;
+    }
+
+    if (context->untethered_linger_timeout_ns > AERON_NULL_VALUE &&
+        (uint64_t)context->untethered_linger_timeout_ns <= context->timer_interval_ns)
+    {
+        errno = EINVAL;
+        AERON_SET_ERR(
+            EINVAL,
+            "untethered_linger_timeout_ns=%" PRIi64 " <= timer_interval_ns=%" PRIu64,
+            context->untethered_linger_timeout_ns, context->timer_interval_ns);
         return -1;
     }
 
@@ -2428,6 +2443,20 @@ uint64_t aeron_driver_context_get_untethered_window_limit_timeout_ns(aeron_drive
         context->untethered_window_limit_timeout_ns : AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_DEFAULT;
 }
 
+int aeron_driver_context_set_untethered_linger_timeout_ns(aeron_driver_context_t *context, uint64_t value)
+{
+    AERON_DRIVER_CONTEXT_SET_CHECK_ARG_AND_RETURN(-1, context);
+
+    context->untethered_linger_timeout_ns = value;
+    return 0;
+}
+
+int64_t aeron_driver_context_get_untethered_linger_timeout_ns(aeron_driver_context_t *context)
+{
+    return NULL != context ?
+        context->untethered_linger_timeout_ns : AERON_NULL_VALUE;
+}
+
 int aeron_driver_context_set_untethered_resting_timeout_ns(aeron_driver_context_t *context, uint64_t value)
 {
     AERON_DRIVER_CONTEXT_SET_CHECK_ARG_AND_RETURN(-1, context);
@@ -3133,8 +3162,15 @@ void aeron_set_thread_affinity_on_start(void *state, const char *role_name)
         }
         aeron_err_clear();
     }
-}
 
+    // if start function was overridden call it here with the explicitly set state
+    if (NULL != context->agent_on_start_func_delegate)
+    {
+        context->agent_on_start_func_delegate(
+            NULL != context->agent_on_start_state_delegate ? context->agent_on_start_state_delegate : state,
+            role_name);
+    }
+}
 
 int aeron_driver_context_set_conductor_cpu_affinity(aeron_driver_context_t *context, int32_t value)
 {
@@ -3182,20 +3218,4 @@ int aeron_driver_context_set_receiver_cpu_affinity(aeron_driver_context_t *conte
 int32_t aeron_driver_context_get_receiver_cpu_affinity(aeron_driver_context_t *context)
 {
     return NULL != context ? context->receiver_cpu_affinity_no :AERON_CPU_AFFINITY_DEFAULT;
-}
-
-int aeron_driver_context_set_async_executor_cpu_affinity(aeron_driver_context_t *context, int32_t value)
-{
-    if (NULL == context)
-    {
-        return -1;
-    }
-
-    context->async_executor_cpu_affinity_no = value;
-    return 0;
-}
-
-int32_t aeron_driver_context_get_async_executor_cpu_affinity(aeron_driver_context_t *context)
-{
-    return NULL != context ? context->async_executor_cpu_affinity_no : AERON_DRIVER_ASYNC_EXECUTOR_CPU_AFFINITY_DEFAULT;
 }
