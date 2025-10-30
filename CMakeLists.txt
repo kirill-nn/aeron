@@ -18,8 +18,10 @@ cmake_policy(VERSION 3.30)
 cmake_policy(SET CMP0003 NEW)
 cmake_policy(SET CMP0135 NEW)
 
+set(AERON_COMPILER_OPTIMIZATION_LEVEL 2)
+
 if (MSVC)
-    add_compile_definitions(/MT)
+    add_compile_definitions(/MT) #-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 endif ()
 
 if (${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
