@@ -121,9 +121,9 @@ typedef struct aeron_publication_image_stct
         aeron_driver_publication_image_revoke_func_t publication_image_revoke;
     } log;
 
-    int64_t last_loss_change_number;
     volatile int64_t begin_loss_change;
     volatile int64_t end_loss_change;
+    int64_t last_loss_change_number;
     int32_t loss_term_id;
     int32_t loss_term_offset;
     size_t loss_length;
@@ -292,7 +292,7 @@ inline bool aeron_publication_image_is_drained(aeron_publication_image_t *image)
     {
         aeron_tetherable_position_t *tetherable_position = &image->conductor_fields.subscribable.array[i];
 
-        if (AERON_SUBSCRIPTION_TETHER_RESTING != tetherable_position->state)
+        if (aeron_driver_subscribable_is_active_state(tetherable_position->state))
         {
             const int64_t sub_pos = aeron_counter_get_acquire(tetherable_position->value_addr);
 
@@ -361,7 +361,7 @@ inline int64_t aeron_publication_image_join_position(aeron_publication_image_t *
     {
         aeron_tetherable_position_t *tetherable_position = &image->conductor_fields.subscribable.array[i];
 
-        if (AERON_SUBSCRIPTION_TETHER_RESTING != tetherable_position->state)
+        if (aeron_driver_subscribable_is_active_state(tetherable_position->state))
         {
             const int64_t sub_pos = aeron_counter_get_acquire(tetherable_position->value_addr);
 

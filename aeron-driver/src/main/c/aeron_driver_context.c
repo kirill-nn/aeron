@@ -138,6 +138,7 @@ static void aeron_driver_conductor_on_endpoint_change_null(const void *channel)
 static void aeron_driver_untethered_subscription_state_change_null(
     aeron_tetherable_position_t *tetherable_position,
     int64_t now_ns,
+    aeron_subscription_tether_state_t old_state,
     aeron_subscription_tether_state_t new_state,
     int32_t stream_id,
     int32_t session_id)
@@ -192,8 +193,9 @@ static void aeron_driver_untethered_subscription_state_change_null(
 #define AERON_RETRANSMIT_UNICAST_LINGER_NS_DEFAULT (10 * 1000 * INT64_C(1000))
 #define AERON_NAK_MULTICAST_GROUP_SIZE_DEFAULT (10)
 #define AERON_NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT (10 * 1000 * INT64_C(1000))
-#define AERON_NAK_UNICAST_DELAY_NS_DEFAULT (100 * INT64_C(1000))
-#define AERON_NAK_UNICAST_RETRY_DELAY_RATIO_DEFAULT (100)
+#define AERON_NAK_UNICAST_DELAY_NS_MIN UINT64_C(1000)
+#define AERON_NAK_UNICAST_DELAY_NS_DEFAULT (AERON_NAK_UNICAST_DELAY_NS_MIN)
+#define AERON_NAK_UNICAST_RETRY_DELAY_RATIO_DEFAULT UINT64_C(100)
 #define AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA_DEFAULT ("default")
 #define AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_INTERCEPTORS_DEFAULT ("")
 #define AERON_RECEIVER_GROUP_CONSIDERATION_DEFAULT (AERON_INFER)
@@ -201,9 +203,9 @@ static void aeron_driver_untethered_subscription_state_change_null(
 #define AERON_PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT (-1)
 #define AERON_PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT (1000)
 #define AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT (1 * 1000 * 1000 * INT64_C(1000))
-#define AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD_NS_DEFAULT (1 * 1000 * 1000 * INT64_C(1000))
-#define AERON_DRIVER_SENDER_CYCLE_THRESHOLD_NS_DEFAULT (1 * 1000 * 1000 * INT64_C(1000))
-#define AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD_NS_DEFAULT (1 * 1000 * 1000 * INT64_C(1000))
+#define AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD_NS_DEFAULT (1 * 1000 * INT64_C(1000))
+#define AERON_DRIVER_SENDER_CYCLE_THRESHOLD_NS_DEFAULT (1 * 1000 * INT64_C(1000))
+#define AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD_NS_DEFAULT (1 * 1000 * INT64_C(1000))
 #define AERON_DRIVER_NAME_RESOLVER_THRESHOLD_NS_DEFAULT (5 * 1000 * 1000 * INT64_C(1000))
 #define AERON_RECEIVER_IO_VECTOR_CAPACITY_DEFAULT UINT32_C(2)
 #define AERON_SENDER_IO_VECTOR_CAPACITY_DEFAULT UINT32_C(2)
@@ -573,7 +575,7 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         AERON_COUNTERS_VALUES_BUFFER_LENGTH_ENV_VAR,
         getenv(AERON_COUNTERS_VALUES_BUFFER_LENGTH_ENV_VAR),
         _context->counters_values_buffer_length,
-        AERON_COUNTERS_VALUES_BUFFER_LENGTH_DEFAULT,
+        AERON_COUNTERS_VALUES_BUFFER_LENGTH_MIN,
         AERON_COUNTERS_VALUES_BUFFER_LENGTH_MAX);
 
     _context->error_buffer_length = aeron_config_parse_size64(
@@ -767,21 +769,26 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT_ENV_VAR,
         getenv(AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT_ENV_VAR),
         _context->untethered_window_limit_timeout_ns,
-        1000,
+        0,
         INT64_MAX);
 
-    _context->untethered_linger_timeout_ns = aeron_config_parse_duration_ns(
+    const uint64_t parsed_untethered_linger_timeout_ns = aeron_config_parse_duration_ns(
         AERON_UNTETHERED_LINGER_TIMEOUT_ENV_VAR,
         getenv(AERON_UNTETHERED_LINGER_TIMEOUT_ENV_VAR),
-        _context->untethered_linger_timeout_ns,
-        1000,
+        UINT64_MAX,
+        0,
         INT64_MAX);
+
+    if (UINT64_MAX != parsed_untethered_linger_timeout_ns)
+    {
+        _context->untethered_linger_timeout_ns = (int64_t)parsed_untethered_linger_timeout_ns;
+    }
 
     _context->untethered_resting_timeout_ns = aeron_config_parse_duration_ns(
         AERON_UNTETHERED_RESTING_TIMEOUT_ENV_VAR,
         getenv(AERON_UNTETHERED_RESTING_TIMEOUT_ENV_VAR),
         _context->untethered_resting_timeout_ns,
-        1000,
+        0,
         INT64_MAX);
 
     _context->max_resend = aeron_config_parse_uint32(
@@ -823,15 +830,26 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         AERON_NAK_UNICAST_DELAY_ENV_VAR,
         getenv(AERON_NAK_UNICAST_DELAY_ENV_VAR),
         _context->nak_unicast_delay_ns,
-        1000,
+        AERON_NAK_UNICAST_DELAY_NS_MIN,
         INT64_MAX);
 
-    _context->receiver_group_tag.value = aeron_config_parse_int64(
+    _context->nak_unicast_retry_delay_ratio = aeron_config_parse_int64(
         AERON_NAK_UNICAST_RETRY_DELAY_RATIO_ENV_VAR,
         getenv(AERON_NAK_UNICAST_RETRY_DELAY_RATIO_ENV_VAR),
         (int64_t)_context->nak_unicast_retry_delay_ratio,
         1,
         INT64_MAX);
+
+    if ((_context->nak_unicast_delay_ns * _context->nak_unicast_retry_delay_ratio) > (uint64_t)INT64_MAX)
+    {
+        AERON_SET_ERR(
+            EINVAL,
+            "nak_unicast_delay_ns (%" PRIu64 ") * nak_unicast_retry_delay_ratio (%" PRIu64 ") exceeds %" PRIi64 "",
+            _context->nak_unicast_delay_ns,
+            _context->nak_unicast_retry_delay_ratio,
+            INT64_MAX);
+        goto error;
+    }
 
     _context->publication_reserved_session_id_low = aeron_config_parse_int32(
         AERON_PUBLICATION_RESERVED_SESSION_ID_LOW_ENV_VAR,
@@ -1158,7 +1176,13 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     _context->next_receiver_id = id_as_uint64->high ^ id_as_uint64->low;
 #else
     /* pure random id */
-    _context->next_receiver_id = aeron_randomised_int32();
+    int64_t receiver_id = 0;
+    do
+    {
+        receiver_id = (int64_t)aeron_randomised_int32() * (int64_t)aeron_randomised_int32();
+    }
+    while (0 == receiver_id);
+    _context->next_receiver_id = receiver_id;
 #endif
 
     if (aeron_netutil_get_so_buf_lengths(
@@ -1401,7 +1425,7 @@ int aeron_driver_validate_untethered_timeouts(aeron_driver_context_t *context)
         return -1;
     }
 
-    if (context->untethered_linger_timeout_ns > AERON_NULL_VALUE &&
+    if (AERON_NULL_VALUE != context->untethered_linger_timeout_ns &&
         (uint64_t)context->untethered_linger_timeout_ns <= context->timer_interval_ns)
     {
         errno = EINVAL;

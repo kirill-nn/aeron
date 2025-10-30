@@ -38,12 +38,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
 
       - name: Setup java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'zulu'
           java-version: ${{ env.JAVA_VERSION }}
@@ -101,7 +101,7 @@ jobs:
 
       # optional: for debugging the uploaded sarif
       - name: Upload loc as a Build Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sarif-results-${{ matrix.language }}
           path: sarif-results

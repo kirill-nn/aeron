@@ -16,19 +16,33 @@
 package io.aeron.cluster;
 
 import io.aeron.Aeron;
+import io.aeron.AeronCounters;
+import io.aeron.ChannelUri;
 import io.aeron.Counter;
+import io.aeron.ExclusivePublication;
+import io.aeron.Image;
 import io.aeron.Publication;
 import io.aeron.Subscription;
-import io.aeron.Image;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.archive.client.ArchiveException;
 import io.aeron.cluster.client.AeronCluster;
+import io.aeron.cluster.client.AeronClusterVersion;
 import io.aeron.cluster.client.ClusterException;
 import io.aeron.cluster.client.ControlledEgressListener;
 import io.aeron.cluster.client.EgressListener;
-import io.aeron.cluster.codecs.*;
+import io.aeron.cluster.codecs.AdminRequestEncoder;
+import io.aeron.cluster.codecs.AdminRequestType;
+import io.aeron.cluster.codecs.AdminResponseCode;
+import io.aeron.cluster.codecs.AdminResponseEncoder;
+import io.aeron.cluster.codecs.CloseReason;
+import io.aeron.cluster.codecs.MessageHeaderDecoder;
+import io.aeron.cluster.codecs.MessageHeaderEncoder;
+import io.aeron.cluster.codecs.SessionMessageHeaderDecoder;
 import io.aeron.cluster.service.ClientSession;
+import io.aeron.cluster.service.ClusterCounters;
+import io.aeron.cluster.service.ClusterTerminationException;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.cluster.service.SnapshotDurationTracker;
 import io.aeron.driver.MediaDriver;
@@ -42,31 +56,37 @@ import io.aeron.security.Authenticator;
 import io.aeron.security.AuthorisationService;
 import io.aeron.security.SessionProxy;
 import io.aeron.status.HeartbeatTimestamp;
-import io.aeron.test.*;
+import io.aeron.test.EventLogExtension;
+import io.aeron.test.InterruptAfter;
+import io.aeron.test.InterruptingTestCallback;
+import io.aeron.test.SlowTest;
+import io.aeron.test.SystemTestWatcher;
+import io.aeron.test.Tests;
 import io.aeron.test.cluster.ClusterTests;
 import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
 import io.aeron.test.driver.TestMediaDriver;
+import org.agrona.AsciiEncoding;
 import org.agrona.BitUtil;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.collections.Hashing;
+import org.agrona.collections.IntArrayList;
 import org.agrona.collections.IntHashSet;
 import org.agrona.collections.MutableBoolean;
 import org.agrona.collections.MutableInteger;
 import org.agrona.collections.MutableLong;
+import org.agrona.concurrent.AgentTerminationException;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.CountersReader;
 import org.hamcrest.CoreMatchers;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.DisabledOnOs;
-import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
@@ -75,30 +95,57 @@ import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntFunction;
 import java.util.function.Predicate;
 import java.util.zip.CRC32;
 
+import static io.aeron.AeronCounters.CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID;
+import static io.aeron.AeronCounters.CLUSTER_SNAPSHOT_COUNTER_TYPE_ID;
+import static io.aeron.CommonContext.ENDPOINT_PARAM_NAME;
+import static io.aeron.CommonContext.REJOIN_PARAM_NAME;
 import static io.aeron.archive.client.AeronArchive.NULL_POSITION;
 import static io.aeron.cluster.client.AeronCluster.SESSION_HEADER_LENGTH;
 import static io.aeron.cluster.service.Cluster.Role.FOLLOWER;
 import static io.aeron.cluster.service.Cluster.Role.LEADER;
-import static io.aeron.logbuffer.FrameDescriptor.*;
-import static io.aeron.protocol.DataHeaderFlyweight.*;
+import static io.aeron.logbuffer.FrameDescriptor.FRAME_ALIGNMENT;
+import static io.aeron.logbuffer.FrameDescriptor.UNFRAGMENTED;
+import static io.aeron.logbuffer.FrameDescriptor.computeMaxMessageLength;
+import static io.aeron.protocol.DataHeaderFlyweight.BEGIN_AND_END_FLAGS;
+import static io.aeron.protocol.DataHeaderFlyweight.CURRENT_VERSION;
+import static io.aeron.protocol.DataHeaderFlyweight.DEFAULT_RESERVE_VALUE;
+import static io.aeron.protocol.DataHeaderFlyweight.HDR_TYPE_DATA;
+import static io.aeron.protocol.DataHeaderFlyweight.HEADER_LENGTH;
 import static io.aeron.status.HeartbeatTimestamp.HEARTBEAT_TYPE_ID;
 import static io.aeron.test.SystemTestWatcher.UNKNOWN_HOST_FILTER;
 import static io.aeron.test.Tests.awaitAvailableWindow;
-import static io.aeron.test.cluster.ClusterTests.*;
-import static io.aeron.test.cluster.TestCluster.*;
+import static io.aeron.test.cluster.ClusterTests.LARGE_MSG;
+import static io.aeron.test.cluster.ClusterTests.NO_OP_MSG;
+import static io.aeron.test.cluster.ClusterTests.REGISTER_TIMER_MSG;
+import static io.aeron.test.cluster.ClusterTests.startPublisherThread;
+import static io.aeron.test.cluster.TestCluster.aCluster;
+import static io.aeron.test.cluster.TestCluster.awaitElectionClosed;
+import static io.aeron.test.cluster.TestCluster.awaitElectionState;
+import static io.aeron.test.cluster.TestCluster.ingressEndpoint;
 import static io.aeron.test.cluster.TestNode.atMost;
 import static java.nio.ByteOrder.LITTLE_ENDIAN;
-import static java.util.concurrent.TimeUnit.*;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.agrona.BitUtil.SIZE_OF_INT;
 import static org.agrona.concurrent.status.CountersReader.NULL_COUNTER_ID;
-import static org.hamcrest.CoreMatchers.*;
-import static org.hamcrest.MatcherAssert.*;
-import static org.hamcrest.number.OrderingComparison.*;
-import static org.junit.jupiter.api.Assertions.*;
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.number.OrderingComparison.greaterThanOrEqualTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrowsExactly;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 @SlowTest
 @ExtendWith({ EventLogExtension.class, InterruptingTestCallback.class })
@@ -204,18 +251,30 @@ class ClusterTest
     }
 
     @Test
+    @InterruptAfter(5)
+    void shouldStartClusterWithExtension()
+    {
+        cluster = aCluster().withStaticNodes(3)
+            .withExtensionSuppler(TestNode.TestConsensusModuleExtension::new)
+            .withServiceSupplier(value -> new TestNode.TestService[0])
+            .start();
+
+        systemTestWatcher.cluster(cluster);
+        cluster.awaitLeader();
+
+        cluster.node(0).validateOnElectionState(0);
+        cluster.node(1).validateOnElectionState(0);
+        cluster.node(2).validateOnElectionState(0);
+    }
+
+    @Test
     @InterruptAfter(30)
     void shouldStopClusteredServicesOnAppropriateMessage()
     {
         cluster = aCluster().withStaticNodes(3).start();
         systemTestWatcher.cluster(cluster);
 
-        final TestNode leader = cluster.awaitLeader();
-
-        TestCluster.awaitElectionClosed(leader);
-        final List<TestNode> followers = cluster.followers();
-        TestCluster.awaitElectionClosed(followers.get(0));
-        TestCluster.awaitElectionClosed(followers.get(1));
+        cluster.awaitLeader();
 
         cluster.terminationsExpected(true);
         cluster.connectClient();
@@ -231,9 +290,6 @@ class ClusterTest
         systemTestWatcher.cluster(cluster);
 
         final TestNode leader = cluster.awaitLeader();
-        final List<TestNode> followers = cluster.followers();
-        TestCluster.awaitElectionClosed(followers.get(0));
-        TestCluster.awaitElectionClosed(followers.get(1));
 
         cluster.node(0).isTerminationExpected(true);
         cluster.node(1).isTerminationExpected(true);
@@ -647,7 +703,7 @@ class ClusterTest
 
         final TestNode firstLeader = cluster.awaitLeader();
 
-        final int sufficientMessageCountForReplay = 1_000_000;
+        final int sufficientMessageCountForReplay = 10_000;
         cluster.connectClient();
         cluster.sendAndAwaitMessages(sufficientMessageCountForReplay);
         cluster.closeClient();
@@ -922,7 +978,7 @@ class ClusterTest
         }
 
         cluster.awaitNewLeadershipEvent(1);
-        cluster.awaitLeaderAndClosedElection();
+        cluster.awaitLeader();
         cluster.followers(2);
     }
 
@@ -1325,69 +1381,41 @@ class ClusterTest
     }
 
     @Test
-    @InterruptAfter(140)
-    @Disabled
-    void shouldHandleManyLargeMessages()
-    {
-        cluster = aCluster().withStaticNodes(3).start();
-
-        systemTestWatcher.cluster(cluster);
-
-        cluster.awaitLeader();
-        awaitElectionState(cluster.node(0), ElectionState.CLOSED);
-        awaitElectionState(cluster.node(1), ElectionState.CLOSED);
-        awaitElectionState(cluster.node(2), ElectionState.CLOSED);
-
-        final int largeMessageCount = 256_000;
-
-        cluster.connectClient();
-        cluster.sendLargeMessages(largeMessageCount);
-        cluster.awaitResponseMessageCount(largeMessageCount);
-        cluster.awaitServicesMessageCount(largeMessageCount);
-    }
-
-    @Test
-    @InterruptAfter(40)
-    @Disabled
+    @InterruptAfter(90)
     void shouldRecoverWhenFollowerWithInitialSnapshotAndArchivePurgeThenIsMultipleTermsBehind()
     {
-        cluster = aCluster().withStaticNodes(3).start();
+        cluster = aCluster()
+            .withLogChannel("aeron:udp?term-length=256k|alias=raft")
+            .withStaticNodes(3)
+            .start();
 
         systemTestWatcher.cluster(cluster);
 
         final TestNode originalLeader = cluster.awaitLeader();
 
-        final int largeMessageCount = 128_000;
-        final int messageCount = 10;
+        final int initialMessageCount = 300;
+        final int additionalMessageCount = 100;
 
         cluster.connectClient();
-        cluster.sendLargeMessages(largeMessageCount);
-        cluster.awaitResponseMessageCount(largeMessageCount);
-        cluster.awaitServicesMessageCount(largeMessageCount);
+        cluster.sendLargeMessages(initialMessageCount);
+        cluster.awaitResponseMessageCount(initialMessageCount);
+        cluster.awaitServicesMessageCount(initialMessageCount);
 
         cluster.takeSnapshot(originalLeader);
         cluster.awaitSnapshotCount(1);
         cluster.purgeLogToLastSnapshot();
 
         cluster.stopNode(originalLeader);
-        final TestNode newLeader = cluster.awaitLeader();
-
-        cluster.reconnectClient();
-        cluster.sendMessages(messageCount);
-        cluster.awaitResponseMessageCount(largeMessageCount + messageCount);
-
-        cluster.stopNode(newLeader);
-        cluster.startStaticNode(newLeader.index(), false);
         cluster.awaitLeader();
 
         cluster.reconnectClient();
-        cluster.sendMessages(messageCount);
-        cluster.awaitResponseMessageCount(largeMessageCount + (messageCount * 2));
+        cluster.sendLargeMessages(additionalMessageCount);
+        cluster.awaitResponseMessageCount(initialMessageCount + additionalMessageCount);
 
         cluster.startStaticNode(originalLeader.index(), false);
         final TestNode lateJoiningNode = cluster.node(originalLeader.index());
 
-        cluster.awaitServiceMessageCount(lateJoiningNode, largeMessageCount + (messageCount * 2));
+        cluster.awaitServiceMessageCount(lateJoiningNode, initialMessageCount + additionalMessageCount);
     }
 
     @Test
@@ -1799,7 +1827,7 @@ class ClusterTest
     }
 
     @Test
-    @InterruptAfter(180)
+    @InterruptAfter(60)
     void shouldRecoverWhenFollowersIsMultipleTermsBehindFromEmptyLogAndPartialLogWithoutCommittedLogEntry()
     {
         cluster = aCluster().withStaticNodes(5).start(4);
@@ -1833,18 +1861,17 @@ class ClusterTest
         }
 
         final TestNode lateJoiningNode = cluster.startStaticNode(4, true);
-
+        TestCluster.awaitElectionClosed(lateJoiningNode);
         cluster.awaitServiceMessageCount(lateJoiningNode, totalMessages);
 
         final TestNode node = cluster.startStaticNode(partialNode, false);
-
+        TestCluster.awaitElectionClosed(node);
         cluster.awaitServiceMessageCount(node, totalMessages);
-
-        cluster.awaitLeader();
 
         cluster.connectClient();
         cluster.sendMessages(messageCount);
         totalMessages += messageCount;
+
         cluster.awaitResponseMessageCount(totalMessages);
         cluster.awaitServiceMessageCount(node, totalMessages);
 
@@ -1994,10 +2021,10 @@ class ClusterTest
             .withServiceSupplier(
                 (i) -> new TestNode.TestService[]
                     {
-                    new TestNode.SleepOnSnapshotTestService()
-                        .snapshotDelayMs(service1SnapshotDelayMs).index(i),
-                    new TestNode.SleepOnSnapshotTestService()
-                        .snapshotDelayMs(service2SnapshotDelayMs).index(i)
+                        new TestNode.SleepOnSnapshotTestService()
+                            .snapshotDelayMs(service1SnapshotDelayMs).index(i),
+                        new TestNode.SleepOnSnapshotTestService()
+                            .snapshotDelayMs(service2SnapshotDelayMs).index(i)
                     })
             .withStaticNodes(3)
             .withAuthorisationServiceSupplier(() -> AuthorisationService.ALLOW_ALL)
@@ -2048,7 +2075,7 @@ class ClusterTest
         assertThat(
             totalSnapshotDurationTracker.maxSnapshotDuration().get(),
             greaterThanOrEqualTo(
-            percent90(MILLISECONDS.toNanos(Math.max(service1SnapshotDelayMs, service2SnapshotDelayMs)))));
+                percent90(MILLISECONDS.toNanos(Math.max(service1SnapshotDelayMs, service2SnapshotDelayMs)))));
 
         assertEquals(1, service1SnapshotDurationTracker.snapshotDurationThresholdExceededCount().get());
         assertThat(
@@ -2068,7 +2095,7 @@ class ClusterTest
             assertThat(
                 snapshotDurationTracker.maxSnapshotDuration().get(),
                 greaterThanOrEqualTo(
-                percent90(MILLISECONDS.toNanos(Math.max(service1SnapshotDelayMs, service2SnapshotDelayMs)))));
+                    percent90(MILLISECONDS.toNanos(Math.max(service1SnapshotDelayMs, service2SnapshotDelayMs)))));
 
             final SnapshotDurationTracker service1SnapshotTracker = follower.container(0).context()
                 .snapshotDurationTracker();
@@ -2204,7 +2231,7 @@ class ClusterTest
     }
 
     @Test
-    @InterruptAfter(60)
+    @InterruptAfter(20)
     void shouldRemainStableWhenThereIsASlowFollower()
     {
         cluster = aCluster().withStaticNodes(3).withLogChannel("aeron:udp?term-length=64k").start();
@@ -2219,43 +2246,41 @@ class ClusterTest
 
         cluster.connectClient();
 
-        final long slowDownDelayMs = 15_000;
+        final long slowDownDelayMs = 1500;
         cluster.sendMessageToSlowDownService(liveFollower.index(), MILLISECONDS.toNanos(slowDownDelayMs));
-        cluster.sendMessages(1000);
+        cluster.sendMessages(100);
 
         final TestNode restartedFollower = cluster.startStaticNode(followerToRestart.index(), false);
         awaitElectionClosed(restartedFollower);
 
-        Tests.sleep(slowDownDelayMs);
-
-        awaitElectionClosed(restartedFollower);
+        cluster.sendMessages(100);
+        cluster.awaitServicesMessageCount(200);
     }
 
-    @ParameterizedTest
-    @ValueSource(ints = { 20, 100 })
-    @InterruptAfter(90)
-    @DisabledOnOs(OS.MAC)
-    void shouldCatchupFollowerWithSlowService(final int sleepTimeMs)
+    @Test
+    @InterruptAfter(20)
+    void shouldCatchupFollowerWithSlowService()
     {
+        final int sleepTimeMs = 100;
         final IntFunction<TestNode.TestService[]> serviceSupplier =
             (i) -> new TestNode.TestService[]
-            {
-                new TestNode.TestService().index(i),
-                new TestNode.TestService()
                 {
-                    public void onSessionMessage(
-                        final ClientSession session,
-                        final long timestamp,
-                        final DirectBuffer buffer,
-                        final int offset,
-                        final int length,
-                        final Header header)
+                    new TestNode.TestService().index(i),
+                    new TestNode.TestService()
                     {
-                        Tests.sleep(sleepTimeMs);
-                        messageCount.incrementAndGet();
-                    }
-                }.index(i)
-            };
+                        public void onSessionMessage(
+                            final ClientSession session,
+                            final long timestamp,
+                            final DirectBuffer buffer,
+                            final int offset,
+                            final int length,
+                            final Header header)
+                        {
+                            Tests.sleep(sleepTimeMs);
+                            messageCount.incrementAndGet();
+                        }
+                    }.index(i)
+                };
 
         cluster = aCluster()
             .withLogChannel("aeron:udp?term-length=1m|alias=log")
@@ -2268,7 +2293,7 @@ class ClusterTest
         cluster.awaitLeader();
         cluster.connectClient();
 
-        final int firstBatchCount = (int)(SECONDS.toMillis(5) / sleepTimeMs);
+        final int firstBatchCount = 500 / sleepTimeMs;
         cluster.sendMessages(firstBatchCount);
         cluster.awaitResponseMessageCount(firstBatchCount);
         cluster.awaitServicesMessageCount(firstBatchCount);
@@ -2277,14 +2302,14 @@ class ClusterTest
         final TestNode followerB = cluster.followers().get(1);
         cluster.stopNode(followerA);
 
-        final int secondBatchCount = (int)(SECONDS.toMillis(7) / sleepTimeMs);
+        final int secondBatchCount = 700 / sleepTimeMs;
         cluster.sendMessages(secondBatchCount);
         cluster.awaitResponseMessageCount(firstBatchCount + secondBatchCount);
         cluster.awaitServiceMessageCount(followerB, firstBatchCount + secondBatchCount);
 
         cluster.startStaticNode(followerA.index(), false);
 
-        final int thirdBatchCount = (int)(SECONDS.toMillis(3) / sleepTimeMs);
+        final int thirdBatchCount = 300 / sleepTimeMs;
         cluster.sendMessages(thirdBatchCount);
         cluster.awaitResponseMessageCount(firstBatchCount + secondBatchCount + thirdBatchCount);
         cluster.awaitServicesMessageCount(firstBatchCount + secondBatchCount + thirdBatchCount);
@@ -2452,7 +2477,7 @@ class ClusterTest
         }
 
         follower2 = cluster.startStaticNode(follower2.index(), false);
-        leader = cluster.awaitLeaderAndClosedElection();
+        leader = cluster.awaitLeader();
         follower1 = cluster.followers().stream()
             .filter(f -> follower1Id == f.consensusModule().context().clusterMemberId())
             .findFirst()
@@ -2517,8 +2542,8 @@ class ClusterTest
         final MutableInteger leadershipCounter1 = new MutableInteger();
         final MutableInteger leadershipCounter2 = new MutableInteger();
         try (TestMediaDriver mediaDriver = TestMediaDriver.launch(new MediaDriver.Context()
-            .threadingMode(ThreadingMode.SHARED)
-            .aeronDirectoryName(tmpDir.resolve("aeron").toString()),
+                .threadingMode(ThreadingMode.SHARED)
+                .aeronDirectoryName(tmpDir.resolve("aeron").toString()),
             systemTestWatcher);
             Archive archive = Archive.launch(new Archive.Context()
                 .aeronDirectoryName(mediaDriver.aeronDirectoryName())
@@ -2618,28 +2643,28 @@ class ClusterTest
             {
                 final IntHashSet logSessions = new IntHashSet();
                 assertEquals(2, aeronArchive.listRecordings(
-                    0,
-                    Integer.MAX_VALUE,
-                    (controlSessionId,
-                    correlationId,
-                    recordingId,
-                    startTimestamp,
-                    stopTimestamp,
-                    startPosition,
-                    stopPosition,
-                    initialTermId,
-                    segmentFileLength,
-                    termBufferLength,
-                    mtuLength,
-                    sessionId,
-                    streamId,
-                    strippedChannel,
-                    originalChannel,
-                    sourceIdentity) ->
-                    {
-                        assertThat(originalChannel, CoreMatchers.containsString("alias=log"));
-                        logSessions.add(sessionId);
-                    }),
+                        0,
+                        Integer.MAX_VALUE,
+                        (controlSessionId,
+                            correlationId,
+                            recordingId,
+                            startTimestamp,
+                            stopTimestamp,
+                            startPosition,
+                            stopPosition,
+                            initialTermId,
+                            segmentFileLength,
+                            termBufferLength,
+                            mtuLength,
+                            sessionId,
+                            streamId,
+                            strippedChannel,
+                            originalChannel,
+                            sourceIdentity) ->
+                        {
+                            assertThat(originalChannel, CoreMatchers.containsString("alias=log"));
+                            logSessions.add(sessionId);
+                        }),
                     "wrong number of recordings");
                 assertEquals(2, logSessions.size());
             }
@@ -2734,42 +2759,42 @@ class ClusterTest
         final MutableInteger sessionCounter = new MutableInteger(0);
 
         cluster = aCluster()
-                .withStaticNodes(3)
-                .withAuthenticationSupplier(() -> new Authenticator()
+            .withStaticNodes(3)
+            .withAuthenticationSupplier(() -> new Authenticator()
+            {
+                @Override
+                public void onConnectRequest(
+                    final long sessionId, final byte[] encodedCredentials, final long nowMs)
                 {
-                    @Override
-                    public void onConnectRequest(
-                        final long sessionId, final byte[] encodedCredentials, final long nowMs)
+                    sessionCounter.increment();
+                }
+
+                @Override
+                public void onChallengeResponse(
+                    final long sessionId, final byte[] encodedCredentials, final long nowMs)
+                {
+                }
+
+                @Override
+                public void onConnectedSession(final SessionProxy sessionProxy, final long nowMs)
+                {
+                    if (sessionCounter.get() > 2)
                     {
-                        sessionCounter.increment();
+                        sessionProxy.reject();
+                    }
+                    else
+                    {
+                        sessionProxy.authenticate("admin".getBytes(StandardCharsets.US_ASCII));
                     }
 
-                    @Override
-                    public void onChallengeResponse(
-                        final long sessionId, final byte[] encodedCredentials, final long nowMs)
-                    {
-                    }
+                }
 
-                    @Override
-                    public void onConnectedSession(final SessionProxy sessionProxy, final long nowMs)
-                    {
-                        if (sessionCounter.get() > 2)
-                        {
-                            sessionProxy.reject();
-                        }
-                        else
-                        {
-                            sessionProxy.authenticate("admin".getBytes(StandardCharsets.US_ASCII));
-                        }
-
-                    }
-
-                    @Override
-                    public void onChallengedSession(final SessionProxy sessionProxy, final long nowMs)
-                    {
-                    }
-                })
-                .start();
+                @Override
+                public void onChallengedSession(final SessionProxy sessionProxy, final long nowMs)
+                {
+                }
+            })
+            .start();
 
         systemTestWatcher.cluster(cluster);
 
@@ -2806,6 +2831,303 @@ class ClusterTest
         }
         assertEquals(sessionIdsByNode[0], sessionIdsByNode[1]);
         assertEquals(sessionIdsByNode[0], sessionIdsByNode[2]);
+    }
+
+    @Test
+    @InterruptAfter(30)
+    void clientShouldHandleRedirectResponseDuringConnectPhaseWithASubsetOfNodesConfigured()
+    {
+        cluster = aCluster().withStaticNodes(3).withClusterId(4).start();
+        systemTestWatcher.cluster(cluster);
+
+        final TestNode leader = cluster.awaitLeader();
+        final String leaderIngressEndpoint =
+            ingressEndpoint(cluster.clusterId(), leader.memberId(), cluster.memberCount());
+
+        final StringBuilder followerIngressEndpoints = new StringBuilder();
+        for (final TestNode node : cluster.followers())
+        {
+            followerIngressEndpoints.append(node.memberId()).append("=")
+                .append(ingressEndpoint(cluster.clusterId(), node.memberId(), cluster.memberCount())).append(",");
+        }
+        followerIngressEndpoints.deleteCharAt(followerIngressEndpoints.length() - 1);
+
+        final TestMediaDriver clientDriver = cluster.startClientMediaDriver();
+
+        try (AeronCluster aeronCluster = AeronCluster.connect(new AeronCluster.Context()
+            .aeronDirectoryName(clientDriver.aeronDirectoryName())
+            .ingressChannel("aeron:udp?alias=ingress")
+            .ingressEndpoints(followerIngressEndpoints.toString())
+            .egressChannel("aeron:udp?endpoint=localhost:0|alias=redirect-test")))
+        {
+            final Publication ingressPublication = aeronCluster.ingressPublication();
+            assertNotNull(ingressPublication);
+            assertEquals(
+                leaderIngressEndpoint,
+                ChannelUri.parse(ingressPublication.channel()).get(ENDPOINT_PARAM_NAME));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "valid", "invalid", "wrong port" })
+    @InterruptAfter(30)
+    void clientShouldReuseLeaderPublicationIfValidDuringRedirectHandling(final String mode)
+    {
+        cluster = aCluster().withStaticNodes(5).withClusterId(2).withAppointedLeader(4).start();
+        systemTestWatcher.cluster(cluster);
+        systemTestWatcher.ignoreErrorsMatching((error) -> error.contains("endpoint=invalid"));
+
+        final TestNode leader = cluster.awaitLeader();
+        final String leaderIngressEndpoint =
+            ingressEndpoint(cluster.clusterId(), leader.memberId(), cluster.memberCount());
+
+        final StringBuilder ingressEndpoints = new StringBuilder();
+        for (final TestNode node : cluster.followers())
+        {
+            ingressEndpoints.append(node.memberId()).append("=")
+                .append(ingressEndpoint(cluster.clusterId(), node.memberId(), cluster.memberCount())).append(",");
+        }
+
+        ingressEndpoints.append(leader.memberId()).append("=");
+        final int separatorIndex = leaderIngressEndpoint.indexOf(':');
+        switch (mode)
+        {
+            case "valid":
+                ingressEndpoints.append(leaderIngressEndpoint);
+                break;
+            case "invalid":
+                ingressEndpoints
+                    .append("invalid")
+                    .append(leaderIngressEndpoint, separatorIndex, leaderIngressEndpoint.length());
+                break;
+            case "wrong port":
+                ingressEndpoints
+                    .append(leaderIngressEndpoint, 0, separatorIndex + 1)
+                    .append(AsciiEncoding.parseIntAscii(
+                        leaderIngressEndpoint,
+                        separatorIndex + 1,
+                        leaderIngressEndpoint.length() - separatorIndex - 1) + 1111);
+                break;
+            default:
+                fail("unknown mode: " + mode);
+        }
+
+        final TestMediaDriver clientDriver = cluster.startClientMediaDriver();
+
+        final ConsensusModule.Context leaderConsensusModule = leader.consensusModule().context();
+        final AtomicInteger availableImageCount = new AtomicInteger();
+        final AtomicInteger unAvailableImageCount = new AtomicInteger();
+        final ChannelUri ingressChannel = ChannelUri.parse(leaderConsensusModule.ingressChannel());
+        ingressChannel.put(ENDPOINT_PARAM_NAME, leaderIngressEndpoint);
+        ingressChannel.put(REJOIN_PARAM_NAME, "false");
+        try (Aeron leaderClient = Aeron.connect(
+            new Aeron.Context().aeronDirectoryName(leader.mediaDriver().aeronDirectoryName()));
+            Subscription ingressSubscription = leaderClient.addSubscription(
+                ingressChannel.toString(),
+                leaderConsensusModule.ingressStreamId(),
+                (image) -> availableImageCount.getAndIncrement(),
+                (image) -> unAvailableImageCount.getAndIncrement());
+            AeronCluster aeronCluster = AeronCluster.connect(new AeronCluster.Context()
+                .aeronDirectoryName(clientDriver.aeronDirectoryName())
+                .ingressChannel("aeron:udp?alias=ingress")
+                .ingressEndpoints(ingressEndpoints.toString())
+                .egressChannel("aeron:udp?endpoint=localhost:0|alias=redirect-test")))
+        {
+            final Publication ingressPublication = aeronCluster.ingressPublication();
+            assertNotNull(ingressPublication);
+            Tests.awaitConnected(ingressPublication);
+            Tests.awaitConnected(ingressSubscription);
+
+            assertEquals(
+                leaderIngressEndpoint,
+                ChannelUri.parse(ingressPublication.channel()).get(ENDPOINT_PARAM_NAME));
+            Tests.await(() -> availableImageCount.get() > 0);
+            assertEquals(1, availableImageCount.get());
+            assertEquals(0, unAvailableImageCount.get());
+        }
+    }
+
+    @Test
+    @InterruptAfter(15)
+    void clusterShouldCreateSessionCounterForEachConnectedClient()
+    {
+        cluster = aCluster().withStaticNodes(3).start();
+        systemTestWatcher.cluster(cluster);
+
+        final TestNode leader = cluster.awaitLeader();
+        final ConsensusModule.Context leaderContext = leader.consensusModule().context();
+        final CountersReader leaderCounters = leaderContext.aeron().countersReader();
+
+        final TestMediaDriver clientDriver = cluster.startClientMediaDriver();
+
+        final AeronCluster.Context context =
+            cluster.clientCtx().aeronDirectoryName(clientDriver.aeronDirectoryName());
+        final IntArrayList sessionCounters = new IntArrayList();
+        try (AeronCluster client1 = AeronCluster.connect(context.clone().clientName("test client"));
+            AeronCluster client2 = AeronCluster.connect(context.clone().clientName(null)))
+        {
+            leaderCounters.forEach((counterId, typeId, keyBuffer, label) ->
+            {
+                if (AeronCounters.CLUSTER_SESSION_TYPE_ID == typeId)
+                {
+                    sessionCounters.add(counterId);
+                    assertEquals(leaderContext.clusterId(), keyBuffer.getInt(0));
+                    final long clusterSessionId = keyBuffer.getLong(SIZE_OF_INT);
+                    if (client1.clusterSessionId() == clusterSessionId)
+                    {
+                        assertEquals(clusterSessionCounterLabel(client1, leaderContext.clusterId()), label);
+                    }
+                    else
+                    {
+                        assertEquals(client2.clusterSessionId(), clusterSessionId);
+                        assertEquals(clusterSessionCounterLabel(client2, leaderContext.clusterId()), label);
+                    }
+                }
+            });
+            assertEquals(2, sessionCounters.size(), "cluster-session counters not found");
+        }
+
+        Tests.await(() -> sessionCounters.intStream()
+            .allMatch(counterId -> CountersReader.RECORD_RECLAIMED == leaderCounters.getCounterState(counterId)));
+    }
+
+    @Test
+    @InterruptAfter(10)
+    void shouldSwitchBackToActiveStateIfSnapshotFailsWithException()
+    {
+        class ThrowingExtension extends TestNode.TestConsensusModuleExtension
+        {
+            public void onTakeSnapshot(final ExclusivePublication snapshotPublication)
+            {
+                throw new RuntimeException("some snapshot error");
+            }
+        }
+
+        systemTestWatcher.ignoreErrorsMatching((error) -> error.contains("failed to take snapshot"));
+        cluster = aCluster().withStaticNodes(3)
+            .withExtensionSuppler(ThrowingExtension::new)
+            .withServiceSupplier(value -> new TestNode.TestService[0])
+            .start();
+
+        systemTestWatcher.cluster(cluster);
+        final TestNode leader = cluster.awaitLeader();
+        cluster.connectClient();
+        cluster.sendMessages(5);
+
+        cluster.takeSnapshot(leader);
+
+        Tests.awaitValue(leader.consensusModule().context().errorCounter(), 1);
+        Tests.await(() -> ConsensusModule.State.ACTIVE == leader.moduleState());
+        Tests.awaitValue(cluster.getClusterControlToggle(leader), ClusterControl.ToggleState.NEUTRAL.code());
+        assertEquals(0, leader.consensusModule().context().snapshotCounter().get());
+
+        for (final TestNode follower : cluster.followers())
+        {
+            Tests.awaitValue(follower.consensusModule().context().errorCounter(), 1);
+            Tests.await(() -> ConsensusModule.State.ACTIVE == follower.moduleState());
+            assertEquals(0, follower.consensusModule().context().snapshotCounter().get());
+        }
+    }
+
+    @Test
+    @InterruptAfter(10)
+    void shouldContinueTerminationSequenceIfSnapshotFailsWithException()
+    {
+        class ThrowingExtension extends TestNode.TestConsensusModuleExtension
+        {
+            public void onTakeSnapshot(final ExclusivePublication snapshotPublication)
+            {
+                throw new RuntimeException("some other error");
+            }
+        }
+
+        systemTestWatcher.ignoreErrorsMatching((error) -> error.contains("failed to take snapshot"));
+        cluster = aCluster().withStaticNodes(3)
+            .withExtensionSuppler(ThrowingExtension::new)
+            .withServiceSupplier(value -> new TestNode.TestService[0])
+            .withErrorCounterSupplier((aeron) ->
+                addStaticCounter(aeron, CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID, "error"))
+            .withSnapshotCounterSupplier((aeron) ->
+                addStaticCounter(aeron, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, "snapshot"))
+            .start();
+        systemTestWatcher.cluster(cluster);
+
+        final TestNode leader = cluster.awaitLeader();
+        cluster.connectClient();
+        cluster.sendMessages(5);
+
+        cluster.terminationsExpected(true);
+        cluster.shutdownCluster(leader);
+        cluster.awaitNodeTerminations();
+
+        for (int i = 0; i < cluster.memberCount(); i++)
+        {
+            final TestNode node = cluster.node(i);
+            Tests.awaitValue(node.consensusModule().context().errorCounter(), 1);
+            assertEquals(0, node.consensusModule().context().snapshotCounter().get());
+        }
+
+        cluster.stopAllNodes();
+    }
+
+    @ParameterizedTest
+    @MethodSource("terminalExceptions")
+    @InterruptAfter(10)
+    void shouldShutdownClusterIfSnapshotFailsWithTerminalException(final RuntimeException terminalException)
+    {
+        class ThrowingExtension extends TestNode.TestConsensusModuleExtension
+        {
+            public void onTakeSnapshot(final ExclusivePublication snapshotPublication)
+            {
+                throw terminalException;
+            }
+        }
+
+        systemTestWatcher.ignoreErrorsMatching((error) -> error.contains("failed to take snapshot"));
+        cluster = aCluster().withStaticNodes(3)
+            .withExtensionSuppler(ThrowingExtension::new)
+            .withServiceSupplier(value -> new TestNode.TestService[0])
+            .withErrorCounterSupplier((aeron) ->
+                addStaticCounter(aeron, CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID, "error"))
+            .withSnapshotCounterSupplier((aeron) ->
+                addStaticCounter(aeron, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, "snapshot"))
+            .start();
+        systemTestWatcher.cluster(cluster);
+
+        final TestNode leader = cluster.awaitLeader();
+        cluster.connectClient();
+        cluster.sendMessages(5);
+
+        cluster.terminationsExpected(true);
+        cluster.takeSnapshot(leader);
+        cluster.awaitNodeTerminations();
+
+        for (int i = 0; i < cluster.memberCount(); i++)
+        {
+            final TestNode node = cluster.node(i);
+            Tests.awaitValue(node.consensusModule().context().errorCounter(), 1);
+            assertEquals(0, node.consensusModule().context().snapshotCounter().get());
+        }
+
+        cluster.stopAllNodes();
+    }
+
+    private static List<RuntimeException> terminalExceptions()
+    {
+        return List.of(
+            new AgentTerminationException("test"),
+            new ClusterTerminationException(true),
+            new ArchiveException("disc is gone", ArchiveException.STORAGE_SPACE));
+    }
+
+    private String clusterSessionCounterLabel(final AeronCluster client, final int clusterId)
+    {
+        final Publication ingressPublication = client.ingressPublication();
+        return "cluster-session: name=" + client.context().clientName() + " " +
+            AeronCounters.formatVersionInfo(AeronClusterVersion.VERSION, AeronClusterVersion.GIT_SHA) +
+            " sourceIdentity=" + ingressPublication.localSocketAddresses().get(0) +
+            " sessionId=" + ingressPublication.sessionId() +
+            ClusterCounters.CLUSTER_ID_LABEL_SUFFIX + clusterId;
     }
 
     private long readSnapshot(final TestNode node)
@@ -3059,5 +3381,12 @@ class ClusterTest
             });
 
         return hasResponse;
+    }
+
+    private static Counter addStaticCounter(final Aeron aeron, final int typeId, final String label)
+    {
+        final long registrationId = aeron.nextCorrelationId();
+        return aeron.addStaticCounter(
+            typeId, label + "-" + registrationId, registrationId);
     }
 }

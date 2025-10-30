@@ -139,6 +139,9 @@ if (UNIX)
 
     if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "11.0")
         add_compile_options(-Wno-error=maybe-uninitialized)
+    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "21.0")
+        # See gtest: https://github.com/google/googletest/issues/4762
+        add_compile_options(-Wno-error=character-conversion)
     endif ()
 
     if (C_WARNINGS_AS_ERRORS)
@@ -300,8 +303,8 @@ if (AERON_BUILD_SAMPLES)
     set(HDR_HISTOGRAM_BUILD_PROGRAMS "OFF" CACHE INTERNAL "Set build programs option")
     FetchContent_Declare(
         hdr_histogram
-        URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/HdrHistogram_c-0.11.8.zip
-        URL_MD5 e993a4a08ad084ea0a895e7b2502de99)
+        URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/HdrHistogram_c-0.11.9.zip
+        URL_MD5 dce4d27b89ea0f73cc74be505dc957e3)
 
     FetchContent_MakeAvailable(hdr_histogram)
 endif ()

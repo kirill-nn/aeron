@@ -30,6 +30,7 @@ typedef struct aeron_archive_proxy_stct
     int64_t control_session_id;
     int retry_attempts;
     uint8_t buffer[AERON_ARCHIVE_PROXY_REQUEST_BUFFER_LENGTH];
+    char client_info[AERON_COUNTER_MAX_CLIENT_NAME_LENGTH * 2];
 }
 aeron_archive_proxy_t;
 
@@ -236,5 +237,11 @@ bool aeron_archive_proxy_migrate_segments(
     int64_t correlation_id,
     int64_t src_recording_id,
     int64_t dst_recording_id);
+
+bool aeron_archive_proxy_update_channel(
+    aeron_archive_proxy_t *archive_proxy,
+    int64_t correlation_id,
+    int64_t recording_id,
+    const char *new_channel);
 
 #endif //AERON_ARCHIVE_PROXY_H

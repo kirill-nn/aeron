@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
+#include <stdio.h>
+
+#include "aeron_alloc.h"
 #include "aeron_archive.h"
+#include "aeron_archive_client_version.h"
 #include "aeron_archive_context.h"
 #include "aeron_archive_proxy.h"
 #include "aeron_archive_configuration.h"
 #include "aeron_archive_replay_params.h"
-
-#include "aeron_alloc.h"
 #include "util/aeron_error.h"
 
 #include "c/aeron_archive_client/authConnectRequest.h"
@@ -55,6 +57,7 @@
 #include "c/aeron_archive_client/purgeSegmentsRequest.h"
 #include "c/aeron_archive_client/attachSegmentsRequest.h"
 #include "c/aeron_archive_client/migrateSegmentsRequest.h"
+#include "c/aeron_archive_client/updateChannelRequest.h"
 
 int64_t aeron_archive_proxy_offer_once(aeron_archive_proxy_t *archive_proxy, size_t length);
 
@@ -91,6 +94,20 @@ int aeron_archive_proxy_init(
     aeron_exclusive_publication_t *exclusive_publication,
     int retry_attempts)
 {
+    int total_length = snprintf(
+        archive_proxy->client_info,
+        sizeof(archive_proxy->client_info),
+        "name=%s version=%s commit=%s",
+        ctx->client_name,
+        aeron_archive_client_version_text(),
+        aeron_archive_client_version_git_sha());
+    if (total_length < 0)
+    {
+        AERON_SET_ERR(errno, "%s", "Failed to format client_info");
+        return -1;
+    }
+    archive_proxy->client_info[total_length] = '\0';
+
     archive_proxy->ctx = ctx;
     archive_proxy->exclusive_publication = exclusive_publication;
     archive_proxy->control_session_id = AERON_NULL_VALUE;
@@ -152,6 +169,10 @@ bool aeron_archive_proxy_try_connect(
         &codec,
         NULL == encoded_credentials ? "" : encoded_credentials->data,
         NULL == encoded_credentials ? 0 : encoded_credentials->length);
+    aeron_archive_client_authConnectRequest_put_clientInfo(
+        &codec,
+        archive_proxy->client_info,
+        strlen(archive_proxy->client_info));
 
     return aeron_archive_proxy_offer_once(
         archive_proxy,
@@ -991,6 +1012,30 @@ bool aeron_archive_proxy_migrate_segments(
     return aeron_archive_proxy_offer(
         archive_proxy,
         aeron_archive_client_migrateSegmentsRequest_encoded_length(&codec));
+}
+
+bool aeron_archive_proxy_update_channel(
+        aeron_archive_proxy_t *archive_proxy,
+        int64_t correlation_id,
+        int64_t recording_id,
+        const char *new_channel)
+{
+    struct aeron_archive_client_updateChannelRequest codec;
+    struct aeron_archive_client_messageHeader hdr;
+
+    aeron_archive_client_updateChannelRequest_wrap_and_apply_header(
+            &codec,
+            (char *)archive_proxy->buffer,
+            0,
+            AERON_ARCHIVE_PROXY_REQUEST_BUFFER_LENGTH,
+            &hdr);
+    aeron_archive_client_updateChannelRequest_set_controlSessionId(&codec, archive_proxy->control_session_id);
+    aeron_archive_client_updateChannelRequest_set_correlationId(&codec, correlation_id);
+    aeron_archive_client_updateChannelRequest_set_recordingId(&codec, recording_id);
+    aeron_archive_client_updateChannelRequest_put_channel(&codec, new_channel, strlen(new_channel));
+
+    return aeron_archive_proxy_offer(
+            archive_proxy, aeron_archive_client_updateChannelRequest_encoded_length(&codec));
 }
 
 /* ************* */

@@ -2113,6 +2113,11 @@ static int aeron_driver_conductor_find_response_publication_image(
         return -1;
     }
 
+    if (AERON_URI_PROTOTYPE_VALUE_CORRELATION_ID == params->response_correlation_id)
+    {
+        return 0;
+    }
+
     for (size_t i = 0; i < conductor->publication_images.length; i++)
     {
         aeron_publication_image_t *image_entry = conductor->publication_images.array[i].image;
@@ -2257,6 +2262,12 @@ aeron_network_publication_t *aeron_driver_conductor_get_or_add_network_publicati
 
             if (ensure_capacity_result >= 0)
             {
+                if (params->is_response &&
+                    AERON_URI_PROTOTYPE_VALUE_CORRELATION_ID == params->response_correlation_id)
+                {
+                    params->term_length = AERON_LOGBUFFER_TERM_MIN_LENGTH;
+                }
+
                 if (!params->has_session_id)
                 {
                     aeron_driver_conductor_update_next_session_id(conductor, speculated_session_id);
@@ -3023,6 +3034,19 @@ void aeron_driver_conductor_on_operation_succeeded(aeron_driver_conductor_t *con
         conductor, AERON_RESPONSE_ON_OPERATION_SUCCESS, response, sizeof(aeron_operation_succeeded_t));
 }
 
+void aeron_driver_conductor_response_next_available_session_id(
+    aeron_driver_conductor_t *conductor, int64_t correlation_id, int32_t next_session_id)
+{
+    char response_buffer[sizeof(aeron_next_available_session_id_response_t)];
+    aeron_next_available_session_id_response_t *response = (aeron_next_available_session_id_response_t *)response_buffer;
+
+    response->correlation_id = correlation_id;
+    response->next_session_id = next_session_id;
+
+    aeron_driver_conductor_client_transmit(
+        conductor, AERON_RESPONSE_ON_NEXT_AVAILABLE_SESSION_ID, response, sizeof(aeron_next_available_session_id_response_t));
+}
+
 void aeron_driver_conductor_on_client_timeout(aeron_driver_conductor_t *conductor, int64_t client_id)
 {
     char response_buffer[sizeof(aeron_client_timeout_t)];
@@ -3658,6 +3682,21 @@ aeron_rb_read_action_t aeron_driver_conductor_on_command(
             break;
         }
 
+        case AERON_COMMAND_GET_NEXT_AVAILABLE_SESSION_ID:
+        {
+            aeron_get_next_available_session_id_command_t *command = (aeron_get_next_available_session_id_command_t *)message;
+
+            if (length < sizeof(aeron_get_next_available_session_id_command_t))
+            {
+                goto malformed_command;
+            }
+
+            correlation_id = command->correlated.correlation_id;
+
+            aeron_driver_conductor_on_get_next_available_session_id(conductor, command);
+            break;
+        }
+
         default:
             AERON_SET_ERR(-AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, "command=%d unknown", msg_type_id);
             aeron_driver_conductor_log_error(conductor);
@@ -3884,6 +3923,7 @@ int aeron_driver_subscribable_add_position(
     {
         aeron_tetherable_position_t *entry = &subscribable->array[subscribable->length];
         entry->is_tether = link->is_tether;
+        entry->is_rejoin = link->is_rejoin;
         entry->state = AERON_SUBSCRIPTION_TETHER_ACTIVE;
         entry->counter_id = counter_id;
         entry->value_addr = value_addr;
@@ -3904,9 +3944,9 @@ void aeron_driver_subscribable_remove_position(aeron_subscribable_t *subscribabl
         aeron_tetherable_position_t *tetherable_position = &subscribable->array[i];
         if (counter_id == tetherable_position->counter_id)
         {
-            if (AERON_SUBSCRIPTION_TETHER_RESTING == tetherable_position->state)
+            if (!aeron_driver_subscribable_is_active_state(tetherable_position->state))
             {
-                subscribable->resting_count--;
+                subscribable->inactive_count--;
             }
 
             subscribable->remove_position_hook_func(subscribable->clientd, tetherable_position->value_addr);
@@ -3993,33 +4033,44 @@ int aeron_driver_conductor_link_subscribable(
 void aeron_driver_subscribable_state(
     aeron_subscribable_t *subscribable,
     aeron_tetherable_position_t *tetherable_position,
-    aeron_subscription_tether_state_t state,
-    int64_t now_ns)
+    const aeron_subscription_tether_state_t state,
+    int64_t now_ns,
+    int32_t stream_id,
+    int32_t session_id,
+    aeron_untethered_subscription_state_change_func_t log_func)
 {
-    if (tetherable_position->state != state)
+    aeron_subscription_tether_state_t old_state = tetherable_position->state;
+    if (state != old_state)
     {
-        if (AERON_SUBSCRIPTION_TETHER_RESTING == state)
+        if (!aeron_driver_subscribable_is_active_state(state))
         {
-            subscribable->resting_count++;
+            subscribable->inactive_count++;
         }
-        else if (AERON_SUBSCRIPTION_TETHER_RESTING == tetherable_position->state)
+        else if (!aeron_driver_subscribable_is_active_state(old_state))
         {
-            subscribable->resting_count--;
+            subscribable->inactive_count--;
         }
     }
 
     tetherable_position->state = state;
     tetherable_position->time_of_last_update_ns = now_ns;
+
+    log_func(tetherable_position, now_ns, old_state, state, stream_id, session_id);
 }
 
 size_t aeron_driver_subscribable_working_position_count(aeron_subscribable_t *subscribable)
 {
-    return subscribable->length - subscribable->resting_count;
+    return subscribable->length - subscribable->inactive_count;
 }
 
 bool aeron_driver_subscribable_has_working_positions(aeron_subscribable_t *subscribable)
 {
-    return subscribable->resting_count < subscribable->length;
+    return subscribable->length > subscribable->inactive_count;
+}
+
+bool aeron_driver_subscribable_is_active_state(aeron_subscription_tether_state_t state)
+{
+    return state != AERON_SUBSCRIPTION_TETHER_RESTING && state != AERON_SUBSCRIPTION_TETHER_CLOSED;
 }
 
 void aeron_driver_conductor_unlink_subscribable(aeron_subscription_link_t *link, aeron_subscribable_t *subscribable)
@@ -4402,7 +4453,7 @@ int aeron_driver_conductor_on_add_ipc_subscription(
     link->client_id = command->correlated.client_id;
     link->registration_id = command->correlated.correlation_id;
     link->is_reliable = true;
-    link->is_rejoin = true;
+    link->is_rejoin = params.is_rejoin;
     link->is_response = params.is_response;
     link->group = AERON_INFER;
     link->is_sparse = params.is_sparse;
@@ -5243,7 +5294,7 @@ int aeron_driver_conductor_on_add_receive_ipc_destination(
     link->client_id = command->correlated.client_id;
     link->registration_id = mds_subscription_link->registration_id;
     link->is_reliable = true;
-    link->is_rejoin = true;
+    link->is_rejoin = params.is_rejoin;
     link->is_response = false;
     link->group = AERON_INFER;
     link->is_sparse = params.is_sparse;
@@ -5983,6 +6034,40 @@ int aeron_driver_conductor_on_invalidate_image(
     return 0;
 }
 
+int aeron_driver_conductor_on_get_next_available_session_id(
+    aeron_driver_conductor_t *conductor, aeron_get_next_available_session_id_command_t *command)
+{
+    const int32_t stream_id = command->stream_id;
+    outer: while (true)
+    {
+        const int32_t next_session_id = aeron_driver_conductor_next_session_id(conductor);
+        aeron_driver_conductor_update_next_session_id(conductor, next_session_id);
+
+        for (size_t i = 0; i < conductor->ipc_publications.length; i++)
+        {
+            aeron_ipc_publication_t *pub_entry = conductor->ipc_publications.array[i].publication;
+
+            if (stream_id == pub_entry->stream_id && next_session_id == pub_entry->session_id)
+            {
+                goto outer;
+            }
+        }
+
+        for (size_t i = 0; i < conductor->network_publications.length; i++)
+        {
+            aeron_network_publication_t *pub_entry = conductor->network_publications.array[i].publication;
+            if (stream_id == pub_entry->stream_id && next_session_id == pub_entry->session_id)
+            {
+                goto outer;
+            }
+        }
+
+        aeron_driver_conductor_response_next_available_session_id(
+            conductor, command->correlated.correlation_id, next_session_id);
+        return 0;
+    }
+}
+
 void aeron_driver_conductor_unlink_ipc_subscriptions(
     aeron_driver_conductor_t *conductor, aeron_ipc_publication_t *publication)
 {
@@ -6149,6 +6234,7 @@ void aeron_driver_conductor_on_create_publication_image(void *clientd, void *ite
     {
         aeron_counters_manager_free(&conductor->counters_manager, rcv_hwm_position.counter_id);
         aeron_counters_manager_free(&conductor->counters_manager, rcv_pos_position.counter_id);
+        aeron_counters_manager_free(&conductor->counters_manager, rcv_naks_sent.counter_id);
         AERON_APPEND_ERR("stream_id=%d session_id=%d", command->stream_id, command->session_id);
         goto error_cleanup;
     }

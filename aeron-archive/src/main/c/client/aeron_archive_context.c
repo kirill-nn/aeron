@@ -95,11 +95,18 @@ int aeron_archive_context_init(aeron_archive_context_t **ctx)
         AERON_DATA_HEADER_LENGTH,
         AERON_MAX_UDP_PAYLOAD_LENGTH);
 
+    _ctx->client_name[0] = '\0';
+
     char *value = NULL;
 
     if ((value = getenv(AERON_DIR_ENV_VAR)))
     {
         aeron_archive_context_set_aeron_directory_name(_ctx, value);
+    }
+
+    if ((value = getenv(AERON_ARCHIVE_CLIENT_NAME_ENV_VAR)))
+    {
+        aeron_archive_context_set_client_name(_ctx, value);
     }
 
     if ((value = getenv(AERON_ARCHIVE_CONTROL_CHANNEL_ENV_VAR)))
@@ -306,6 +313,32 @@ int aeron_archive_context_conclude(aeron_archive_context_t *ctx)
         goto error;
     }
 
+    if (NULL == ctx->aeron)
+    {
+        ctx->owns_aeron_client = true;
+
+        aeron_context_t *aeron_ctx;
+        if (aeron_context_init(&aeron_ctx) < 0 ||
+            aeron_context_set_dir(aeron_ctx, ctx->aeron_directory_name) < 0)
+        {
+            AERON_APPEND_ERR("%s", "");
+            goto error;
+        }
+
+        if (aeron_context_set_client_name(aeron_ctx, "archive-client") < 0)
+        {
+            AERON_APPEND_ERR("%s", "");
+            goto error;
+        }
+
+        if (aeron_init(&ctx->aeron, aeron_ctx) < 0 ||
+            aeron_start(ctx->aeron) < 0)
+        {
+            AERON_APPEND_ERR("%s", "");
+            goto error;
+        }
+    }
+
     aeron_uri_string_builder_t request_channel;
     if (aeron_archive_apply_default_parameters(ctx, ctx->control_request_channel, &request_channel) < 0)
     {
@@ -321,15 +354,32 @@ int aeron_archive_context_conclude(aeron_archive_context_t *ctx)
         goto error;
     }
 
-    bool response_channels = true;
-    int32_t session_id = -1;
     const char* control_mode =
         aeron_uri_string_builder_get(&response_channel, AERON_UDP_CHANNEL_CONTROL_MODE_KEY);
     if (NULL == control_mode ||
         0 != strcmp(AERON_UDP_CHANNEL_CONTROL_MODE_RESPONSE_VALUE, control_mode))
     {
-        response_channels = false;
-        session_id = aeron_randomised_int32();
+        aeron_async_get_next_available_session_id_t *async = NULL;
+        if (aeron_async_next_session_id(&async, ctx->aeron, ctx->control_request_stream_id) < 0)
+        {
+            AERON_APPEND_ERR("%s", "Failed to fetch next session-id");
+            goto error_close_uri_builders;
+        }
+
+        int result = 0;
+        int32_t session_id;
+        do
+        {
+            aeron_archive_context_invoke_aeron_client(ctx);
+
+            result = aeron_async_next_session_id_poll(&session_id, async);
+            if (result < 0)
+            {
+                AERON_APPEND_ERR("%s", "Failed to fetch next session-id");
+                goto error_close_uri_builders;
+            }
+        } while (0 == result);
+
         if (aeron_uri_string_builder_put_int32(&request_channel, AERON_URI_SESSION_ID_KEY, session_id) < 0 ||
             aeron_uri_string_builder_put_int32(&response_channel, AERON_URI_SESSION_ID_KEY, session_id) < 0)
         {
@@ -355,48 +405,6 @@ int aeron_archive_context_conclude(aeron_archive_context_t *ctx)
 
     aeron_uri_string_builder_close(&request_channel);
     aeron_uri_string_builder_close(&response_channel);
-
-    if (NULL == ctx->aeron)
-    {
-        ctx->owns_aeron_client = true;
-
-        aeron_context_t *aeron_ctx;
-        if (aeron_context_init(&aeron_ctx) < 0 ||
-            aeron_context_set_dir(aeron_ctx, ctx->aeron_directory_name) < 0)
-        {
-            AERON_APPEND_ERR("%s", "");
-            goto error;
-        }
-
-        char buff[AERON_COUNTER_MAX_CLIENT_NAME_LENGTH + 1];
-        buff[AERON_COUNTER_MAX_CLIENT_NAME_LENGTH] = 0;
-        int name_prefix_length = snprintf(buff, sizeof(buff), "archive-client ");
-
-        if (name_prefix_length >= 0 && name_prefix_length < AERON_COUNTER_MAX_CLIENT_NAME_LENGTH)
-        {
-            if (response_channels)
-            {
-                snprintf(buff + name_prefix_length, sizeof(buff) - name_prefix_length, "control-mode=response");
-            }
-            else
-            {
-                snprintf(buff + name_prefix_length, sizeof(buff) - name_prefix_length, "session-id=%" PRIi32, session_id);
-            }
-        }
-
-        if (aeron_context_set_client_name(aeron_ctx, buff) < 0)
-        {
-            AERON_APPEND_ERR("%s", "");
-            goto error;
-        }
-
-        if (aeron_init(&ctx->aeron, aeron_ctx) < 0 ||
-            aeron_start(ctx->aeron) < 0)
-        {
-            AERON_APPEND_ERR("%s", "");
-            goto error;
-        }
-    }
 
     if (NULL == ctx->idle_strategy_func)
     {
@@ -626,6 +634,25 @@ int aeron_archive_context_set_control_mtu_length(aeron_archive_context_t *ctx, s
 size_t aeron_archive_context_get_control_mtu_length(aeron_archive_context_t *ctx)
 {
     return ctx->control_mtu_length;
+}
+
+int aeron_archive_context_set_client_name(aeron_archive_context_t *context, const char *value)
+{
+    size_t copy_length = 0;
+    if (!aeron_str_length(value, AERON_COUNTER_MAX_CLIENT_NAME_LENGTH + 1, &copy_length))
+    {
+        AERON_SET_ERR(EINVAL, "client_name length must <= %d", AERON_COUNTER_MAX_CLIENT_NAME_LENGTH);
+        return -1;
+    }
+
+    memcpy(context->client_name, value, copy_length);
+    context->client_name[copy_length] = '\0';
+    return 0;
+}
+
+const char *aeron_archive_context_get_client_name(aeron_archive_context_t *context)
+{
+    return context->client_name;
 }
 
 int aeron_archive_context_set_recording_events_channel(

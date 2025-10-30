@@ -449,6 +449,12 @@ int aeron_archive_context_set_control_term_buffer_sparse(aeron_archive_context_t
 bool aeron_archive_context_get_control_term_buffer_sparse(aeron_archive_context_t *ctx);
 
 /**
+ * Specify client name to identify this client on the archive side.
+ */
+int aeron_archive_context_set_client_name(aeron_archive_context_t *context, const char *value);
+const char *aeron_archive_context_get_client_name(aeron_archive_context_t *context);
+
+/**
  * Specify the idle strategy function and associated state used by the client between polling calls.
  */
 int aeron_archive_context_set_idle_strategy(
@@ -1156,6 +1162,16 @@ int aeron_archive_migrate_segments(
     aeron_archive_t *aeron_archive,
     int64_t src_recording_id,
     int64_t dst_recording_id);
+
+/**
+ * Update the channel for a recording, i.e. replace original and stripped channel information in the catalog.
+ *
+ * @param aeron_archive the archive client
+ * @param recording_id the id of the recording.
+ * @param new_channel to use in the catalogue.
+ * @return 0 for success, -1 for failure
+ */
+int aeron_archive_update_channel(aeron_archive_t *aeron_archive, int64_t recording_id, const char *new_channel);
 
 /**
  * Position of the recorded stream at the base of a segment file.
